@@ -429,6 +429,14 @@ def fetch_channel_info(channel_identifier):
 # ====== پایگاه داده ======
 class Database:
     def __init__(self, path):
+        # v3.24.9: اگر پوشهٔ مقصد (مثلاً Volume در Railway) هنوز ساخته نشده باشد،
+        # sqlite3.connect با خطای "unable to open database file" کرش می‌کند.
+        # این‌جا مسیر پدر را از قبل می‌سازیم تا از این کرش‌لوپ جلوگیری شود.
+        try:
+            _parent = Path(path).parent
+            _parent.mkdir(parents=True, exist_ok=True)
+        except Exception as _mkdir_err:
+            logger.error("DB parent dir mkdir failed for %s: %s", path, _mkdir_err)
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
