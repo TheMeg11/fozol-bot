@@ -3899,6 +3899,20 @@ def delete_preview_message(chat_id):
 
 # ====== پخش همگانی (نسخه بهینه‌شده — Parallel + Smart Routing) ======
 
+def broadcast_safe_edit_text(text, chat_id, message_id, reply_markup=None, **kw):
+    """ادیت امن پیام پیشرفت پخش همگانی.
+    برخلاف safe_edit_text، در صورت شکست ادیت پیام جدید نمی‌فرستد — چون گزارش پیشرفت
+    هر ۵ ثانیه آپدیت می‌شود و ارسال پیام جدید در هر بار، موج پیام اضافی برای ادمین می‌سازد.
+    فقط لاگ می‌کند تا thread پخش با خطای ادیت متوقف نشود."""
+    if not message_id:
+        return
+    try:
+        bot.edit_message_text(text, chat_id, message_id, reply_markup=reply_markup, **kw)
+    except Exception as e:
+        # «message is not modified» بی‌اهمیت است (متن تغییری نکرده)؛ بقیه فقط لاگ
+        if 'message is not modified' not in str(e).lower():
+            logger.debug(f"broadcast_safe_edit_text: {e}")
+
 # Rate limiter سراسری برای جلوگیری از 429
 _broadcast_rate_lock = threading.Lock()
 _broadcast_last_send_times = deque()  # زمان‌های ارسال اخیر برای rate limiting
@@ -3966,6 +3980,8 @@ def _send_broadcast_single(broadcast_bot, uid, from_chat_id, message_id,
             # الصاق دکمه‌ها با editMessageReplyMarkup (فقط برای رسانه با دکمه)
             if reply_markup is not None and sent and hasattr(sent, 'message_id'):
                 try:
+                    # هر API call باید rate-limit شود (رسانه+دکمه = ۲ call در هر کاربر)
+                    _rate_limit_wait(max_per_second=25)
                     broadcast_bot.edit_message_reply_markup(
                         chat_id=uid,
                         message_id=sent.message_id,
@@ -4043,13 +4059,22 @@ def _bc_state_read():
 def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
     """اجرای پخش همگانی در thread جداگانه.
     - نمونه مستقل TeleBot (جدا از ربات اصلی)
-    - ارسال ترتیبی (sequential) با تأخیر ۰.۰۵ ثانیه
-    - گزارش زنده هر ۱۰ ثانیه
+    - ارسال موازی با ThreadPoolExecutor + rate limiter (۲۵ پیام/ثانیه)
+    - گزارش زنده هر ۵ ثانیه
     - هندلینگ 429 و 403
-    - v3.23: resume_state — ادامهٔ پخش نیمه‌کاره بعد از قطع/ری‌استارت"""
+    - v3.23: resume_state — ادامهٔ پخش نیمه‌کاره بعد از قطع/ری‌استارت
+    - fix: در فراخوانی از callback «broadcast_confirm_send_all»، آرگومان سوم می‌تواند
+      InlineKeyboardMarkup باشد (نه دیکشنری resume) — چون set_broadcast_mode(False)
+      دکمه‌ها را پاک می‌کند، markup قبل از پاک‌شدن گرفته شده و باید همین‌جا منتقل شود.
+      اینجا تشخیص داده می‌شود: دیکشنری = state واقعی resume، غیردیکشنری = markup پخش تازه."""
+    # سازگاری فراخوانی‌ها: تفکیک markup از state واقعی resume
+    markup_arg = None
+    if resume_state is not None and not isinstance(resume_state, dict):
+        markup_arg = resume_state
+        resume_state = None
     # رفع باگ: try/except در سطح topLevel تا thread در صورت خطا سایلنت نشود
     try:
-        _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state)
+        _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state, markup_arg)
     except Exception as e:
         logger.error(f"Broadcast async fatal error: {e}")
         try:
@@ -4060,9 +4085,10 @@ def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
         except Exception:
             pass
 
-def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
+def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None, markup_arg=None):
     """پیاده‌سازی واقعی پخش همگانی — v3.23: پشتیبانی ادامه از محل قطع.
-    نسخه بهینه‌شده: ThreadPoolExecutor با ۸ worker موازی، smart routing برای متن/رسانه."""
+    نسخه بهینه‌شده: ThreadPoolExecutor موازی، smart routing برای متن/رسانه.
+    markup_arg: دکمه‌های اینلاین منتقل‌شده از callback تأیید (قبل از پاک‌شدن state)."""
     global broadcast_stop_flag
     broadcast_stop_flag.clear()
 
@@ -4100,6 +4126,9 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
         is_resume = False
         # تشخیص نوع پیام برای smart routing
         current_markup = get_broadcast_inline_markup()
+        if current_markup is None and markup_arg is not None:
+            # markup از callback تأیید آمده (قبل از پاک‌شدن state گرفته شده بود)
+            current_markup = markup_arg
         is_text = hasattr(preview_msg, 'content_type') and preview_msg.content_type == 'text'
         text_content = preview_msg.text if is_text else None
         use_one_shot = is_text and current_markup is not None and text_content is not None
@@ -10097,21 +10126,26 @@ def _callback_handler_impl(call):
 
             if data == "broadcast_stop":
                 if user_id != ADMIN_ID:
-                    bot.answer_callback_query(call.id, "⛔")
+                    try: bot.answer_callback_query(call.id, "⛔")
+                    except Exception: pass
                     return
                 broadcast_stop_flag.set()
-                bot.answer_callback_query(call.id, "⏹️ درخواست توقف ارسال شد. چند ثانیه طول می‌کشد...")
+                # مقاوم‌سازی: callback منقضی/تکراری نباید جریان توقف را بشکند
+                try: bot.answer_callback_query(call.id, "⏹️ درخواست توقف ارسال شد. چند ثانیه طول می‌کشد...")
+                except Exception: pass
                 return
 
             # ----- تأیید ارسال به همه (از روی پیام پیش‌نمایش) -----
             if data == "broadcast_confirm_send_all":
                 if user_id != ADMIN_ID:
-                    bot.answer_callback_query(call.id, "⛔")
+                    try: bot.answer_callback_query(call.id, "⛔")
+                    except Exception: pass
                     return
                 # چک اینکه پیام پیش‌نمایش هنوز معتبره
                 with broadcast_lock:
                     if not broadcast_mode or not broadcast_preview_msg:
-                        bot.answer_callback_query(call.id, "❌ حالت پخش همگانی فعال نیست.", show_alert=True)
+                        try: bot.answer_callback_query(call.id, "❌ حالت پخش همگانی فعال نیست.", show_alert=True)
+                        except Exception: pass
                         return
                     preview_msg = broadcast_preview_msg
                     current_markup = broadcast_inline_markup
@@ -10126,7 +10160,12 @@ def _callback_handler_impl(call):
                     pass
 
                 # جلوگیری از کلیک دوبار روی دکمه (القاء loading روی callback)
-                bot.answer_callback_query(call.id, "🚀 شروع ارسال...")
+                # مقاوم‌سازی: callback منقضی/تکراری نباید استارت thread پخش را بشکند —
+                # (بدون این try/except، خطای ۴۰۰ قبل از Thread.start() جریان را سایلنت خراب می‌کند)
+                try:
+                    bot.answer_callback_query(call.id, "🚀 شروع ارسال...")
+                except Exception:
+                    pass
 
                 # شروع ارسال در thread جداگانه با نمونه مستقل TeleBot
                 threading.Thread(
@@ -10139,13 +10178,17 @@ def _callback_handler_impl(call):
             # ----- v3.23: ادامه/لغو پخش همگانی نیمه‌کاره (بعد از ری‌استارت) -----
             if data == "bc_resume_go":
                 if user_id != ADMIN_ID:
-                    bot.answer_callback_query(call.id, "⛔")
+                    try: bot.answer_callback_query(call.id, "⛔")
+                    except Exception: pass
                     return
                 st = _bc_state_read()
                 if not st:
-                    bot.answer_callback_query(call.id, "پخش نیمه‌کاره‌ای برای ادامه نیست.")
+                    try: bot.answer_callback_query(call.id, "پخش نیمه‌کاره‌ای برای ادامه نیست.")
+                    except Exception: pass
                     return
-                bot.answer_callback_query(call.id, "▶️ ادامهٔ پخش از محل قطع...")
+                # مقاوم‌سازی: callback منقضی نباید استارت resume را بشکند
+                try: bot.answer_callback_query(call.id, "▶️ ادامهٔ پخش از محل قطع...")
+                except Exception: pass
                 try:
                     bot.edit_message_text("▶️ ادامهٔ پخش همگانی آغاز شد...", chat_id, call.message.message_id)
                 except Exception:
@@ -10154,10 +10197,12 @@ def _callback_handler_impl(call):
                 return
             if data == "bc_resume_cancel":
                 if user_id != ADMIN_ID:
-                    bot.answer_callback_query(call.id, "⛔")
+                    try: bot.answer_callback_query(call.id, "⛔")
+                    except Exception: pass
                     return
                 _bc_state_clear()
-                bot.answer_callback_query(call.id, "لغو شد.")
+                try: bot.answer_callback_query(call.id, "لغو شد.")
+                except Exception: pass
                 try:
                     bot.edit_message_text("🗑 پخش نیمه‌کاره لغو شد.", chat_id, call.message.message_id)
                 except Exception:
@@ -12034,6 +12079,7 @@ def remind_inactive_users():
 
 def broadcast_timeout_watcher():
     global broadcast_mode, broadcast_admin_chat, broadcast_preview_msg, broadcast_started_at, broadcast_confirm_deadline
+    global broadcast_inline_markup, broadcast_awaiting_buttons, broadcast_preview_sent_msg_id
     while True:
         time.sleep(15)
         try:
@@ -12047,6 +12093,10 @@ def broadcast_timeout_watcher():
                     broadcast_preview_msg = None
                     broadcast_started_at = None
                     broadcast_confirm_deadline = None
+                    # reset متغیرهای جدید broadcast — هم‌راستا با set_broadcast_mode(False)
+                    broadcast_inline_markup = None
+                    broadcast_awaiting_buttons = False
+                    broadcast_preview_sent_msg_id = None
             if notify_chat:
                 try:
                     # جمع‌کردن کیبورد تأیید + اطلاع‌رسانی
