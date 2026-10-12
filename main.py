@@ -104,9 +104,12 @@ BROADCAST_TIMEOUT = config.BROADCAST_TIMEOUT
 XP_BONUS_ONE_TIME = config.XP_BONUS_ONE_TIME
 XP_RECURRING = config.XP_RECURRING
 
-if not TOKEN or TOKEN == "TOKEN_ROBAT_RA_INJA_BENAVISID" or not ADMIN_ID:
-    print("❌ توکن یا شناسه ادمین نامعتبر. متغیرهای محیطی BOT_TOKEN و ADMIN_ID را در تنظیمات (Railway → Variables) تعریف کنید.")
+if not TOKEN or TOKEN == "TOKEN_ROBAT_RA_INJA_BENAVISID":
+    print("❌ توکن نامعتبر. متغیر محیطی BOT_TOKEN را در تنظیمات (Railway → Variables) تعریف کنید.")
     exit(1)
+
+if not ADMIN_ID:
+    print("⚠️ ADMIN_ID ست نشده — حالت تست فعال می‌شود. اولین کاربر که /start بزنه خودکار ادمین می‌شود.")
 
 apihelper.API_URL = "https://tapi.bale.ai/bot{0}/{1}"
 # ====== v3.23: timeout و retry سراسری — پایداری شبکه در مقیاس ۵۰۰۰+ کاربر ======
@@ -2458,6 +2461,44 @@ class Database:
 
 db = Database(str(DB_PATH))
 
+# ====== Auto-Admin (TEST MODE) ======
+# وقتی ADMIN_ID از env ست نشده (==0)، اولین کاربری که /start بزنه به‌صورت خودکار ادمین میشه.
+# این فقط برای تست/دیباگ هست و در محیط production حتماً باید ADMIN_ID در env ست شده باشه.
+def _try_load_auto_admin():
+    """اگه ADMIN_ID == 0، تلاش می‌کنه auto_admin_id رو از دیتابیس بخونه و ADMIN_ID رو آپدیت کنه."""
+    global ADMIN_ID
+    if ADMIN_ID != 0:
+        return
+    try:
+        row = db.conn.execute("SELECT value FROM settings WHERE key='auto_admin_id'").fetchone()
+        if row and row['value']:
+            ADMIN_ID = int(row['value'])
+            logger.info(f"🧪 TEST MODE: Auto-admin loaded from DB: {ADMIN_ID}")
+    except Exception as e:
+        logger.error(f"Auto-admin load error: {e}")
+
+def _set_auto_admin(uid):
+    """در TEST MODE، اولین کاربر به‌عنوان ادمین خودکار در DB ذخیره میشه و ADMIN_ID آپدیت میشه."""
+    global ADMIN_ID
+    if ADMIN_ID != 0:
+        return False
+    try:
+        with db._lock:
+            existing = db.conn.execute("SELECT value FROM settings WHERE key='auto_admin_id'").fetchone()
+            if existing and existing['value']:
+                return False  # از قبل ست شده
+            db.conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                            ("auto_admin_id", str(uid)))
+            db.conn.commit()
+        ADMIN_ID = int(uid)
+        logger.info(f"🧪 TEST MODE: Auto-admin set to {ADMIN_ID}")
+        return True
+    except Exception as e:
+        logger.error(f"Auto-admin set error: {e}")
+        return False
+
+_try_load_auto_admin()
+
 # ====== بارگذاری قیمت‌های VIP از دیتابیس (اگر ادمین قبلاً تغییر داده) ======
 for _days in VIP_PRICES.keys():
     saved = db.get_vip_price(_days)
@@ -3686,13 +3727,23 @@ broadcast_admin_chat = None
 broadcast_preview_msg = None
 broadcast_started_at = None
 broadcast_confirm_deadline = None   # v3.19: ددلاین تأیید پیش‌نمایش (۵ دقیقه)
+# دکمه‌های اینلاین اختیاری برای پخش همگانی (None = بدون دکمه)
+broadcast_inline_markup = None
+# وقتی True است، ادمین در حال وارد کردن تعریف دکمه‌هاست
+broadcast_awaiting_buttons = False
+# شناسه پیام پیش‌نمایش ارسال‌شده به ادمین — برای پاک‌سازی بعد از تصمیم نهایی
+broadcast_preview_sent_msg_id = None
 # NOTE: BROADCAST_TIMEOUT از config.py بارگذاری می‌شود؛ اینجا override نکنید
 
 # Flag توقف پخش همگانی — ادمین می‌تواند وسط ارسال آن را متوقف کند
 broadcast_stop_flag = threading.Event()
 
 def set_broadcast_mode(val, chat=None, msg=None, started=None):
-    global broadcast_mode, broadcast_admin_chat, broadcast_preview_msg, broadcast_started_at, broadcast_confirm_deadline
+    """تنظیم حالت پخش همگانی.
+    هنگام خاموش کردن (val=False)، تمام متغیرهای وابسته از جمله دکمه‌ها ریست می‌شوند."""
+    global broadcast_mode, broadcast_admin_chat, broadcast_preview_msg, broadcast_started_at
+    global broadcast_confirm_deadline, broadcast_inline_markup, broadcast_awaiting_buttons
+    global broadcast_preview_sent_msg_id
     with broadcast_lock:
         broadcast_mode = val
         broadcast_admin_chat = chat
@@ -3700,29 +3751,258 @@ def set_broadcast_mode(val, chat=None, msg=None, started=None):
         broadcast_started_at = started
         if not val:
             broadcast_confirm_deadline = None
+            broadcast_inline_markup = None
+            broadcast_awaiting_buttons = False
+            broadcast_preview_sent_msg_id = None
 
-# ====== پخش همگانی (نسخه پایدار — Sequential + نمونه مستقل TeleBot) ======
+def set_broadcast_inline_markup(markup):
+    """تنظیم دکمه‌های اینلاین برای پیام پخش همگانی."""
+    global broadcast_inline_markup
+    with broadcast_lock:
+        broadcast_inline_markup = markup
 
-def _send_broadcast_single(broadcast_bot, uid, from_chat_id, message_id):
-    """ارسال یک پیام broadcast به یک کاربر با نمونه مستقل TeleBot.
-    برمی‌گرداند ('ok' | 'blocked' | 'failed')."""
+def set_broadcast_awaiting_buttons(val):
+    """تنظیم حالت انتظار برای دریافت تعریف دکمه‌ها از ادمین."""
+    global broadcast_awaiting_buttons
+    with broadcast_lock:
+        broadcast_awaiting_buttons = val
+
+def get_broadcast_inline_markup():
+    """گرفتن کپی امن از دکمه‌های اینلاین فعلی پخش همگانی (یا None)."""
+    with broadcast_lock:
+        return broadcast_inline_markup
+
+def set_broadcast_preview_sent_msg_id(msg_id):
+    """ذخیره شناسه پیام پیش‌نمایش برای پاک‌سازی بعدی."""
+    global broadcast_preview_sent_msg_id
+    with broadcast_lock:
+        broadcast_preview_sent_msg_id = msg_id
+
+def get_broadcast_preview_sent_msg_id():
+    """گرفتن شناسه پیام پیش‌نمایش."""
+    with broadcast_lock:
+        return broadcast_preview_sent_msg_id
+
+def parse_button_definitions(text):
+    """تبدیل متن تعریف دکمه‌ها به InlineKeyboardMarkup.
+    فرمت هر خط:  text|url
+    چند خط = چند دکمه (هر کدام در یک ردیف جدا).
+    برمی‌گرداند: (True, InlineKeyboardMarkup) یا (False, error_message)
+    """
+    lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+    if not lines:
+        return (False, "❌ هیچ خطی پیدا نشد.\n\nفرمت صحیح:\n`متن دکمه|https://example.com`\n`متن دکمه ۲|https://example2.com`")
+
+    buttons = []
+    for i, line in enumerate(lines, 1):
+        if '|' not in line:
+            return (False, f"❌ خط {to_persian_digits(i)}: جداکننده `|` پیدا نشد.\n\nفرمت: `متن دکمه|https://example.com`")
+        parts = line.split('|', 1)
+        btn_text = parts[0].strip()
+        btn_url = parts[1].strip()
+        if not btn_text:
+            return (False, f"❌ خط {to_persian_digits(i)}: متن دکمه خالی است.")
+        if not btn_url:
+            return (False, f"❌ خط {to_persian_digits(i)}: URL دکمه خالی است.")
+        if not (btn_url.startswith('http://') or btn_url.startswith('https://')):
+            return (False, f"❌ خط {to_persian_digits(i)}: URL باید با `http://` یا `https://` شروع شود.\nدریافت شد: `{escape_md(btn_url)}`")
+        buttons.append(types.InlineKeyboardButton(btn_text, url=btn_url))
+
+    if not buttons:
+        return (False, "❌ هیچ دکمه معتبری ساخته نشد.")
+
+    # هر دکمه در یک ردیف جدا (row_width=1)
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(*buttons)
+    return (True, markup)
+
+def broadcast_preview_keyboard(total_users):
+    """کیبورد معمولی پیش‌نمایش پخش همگانی با دکمه‌های کنترلی.
+    شامل: مشاهده پیش‌نمایش / افزودن دکمه اینلاین / حذف دکمه‌ها / لغو."""
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
+    markup.add(
+        types.KeyboardButton("👁 مشاهده پیش‌نمایش"),
+        types.KeyboardButton("➕ افزودن دکمه اینلاین"),
+    )
+    with broadcast_lock:
+        has_buttons = broadcast_inline_markup is not None
+    if has_buttons:
+        markup.add(types.KeyboardButton("🗑 حذف دکمه‌ها"))
+    markup.add(types.KeyboardButton("❌ لغو"))
+    return markup
+
+def send_preview_to_admin(chat_id, preview_msg, inline_markup=None):
+    """ارسال پیش‌نمایش پیام پخش همگانی به ادمین.
+    استراتژی هوشمندانه (همان broadcast):
+    - اگه پیام متنی است و دکمه دارد: send_message با reply_markup (one-shot)
+    - اگه رسانه است یا بدون دکمه: copy_message + editMessageReplyMarkup
+
+    یک دکمه «✅ تأیید و ارسال به همه» نیز به انتهای دکمه‌ها اضافه می‌شود.
+    برمی‌گرداند: message_id پیام پیش‌نمایش یا None در صورت خطا."""
     try:
-        broadcast_bot.copy_message(uid, from_chat_id=from_chat_id, message_id=message_id)
-        return 'ok'
-    except ApiTelegramException as e:
-        if e.error_code == 403:
-            return 'blocked'
-        if e.error_code == 429:
-            # Rate limit — صبر و retry
-            time.sleep(3)
+        # ساختن کیبورد نهایی: دکمه‌های اینلاین تعریف‌شده + دکمه تأیید
+        final_markup = types.InlineKeyboardMarkup(row_width=1)
+        if inline_markup is not None and inline_markup.keyboard:
+            for row in inline_markup.keyboard:
+                for btn in row:
+                    final_markup.add(btn)
+        final_markup.add(types.InlineKeyboardButton(
+            "✅ تأیید و ارسال به همه",
+            callback_data="broadcast_confirm_send_all"
+        ))
+
+        # تشخیص نوع پیام
+        is_text = hasattr(preview_msg, 'content_type') and preview_msg.content_type == 'text'
+        text_content = preview_msg.text if is_text else None
+
+        # استراتژی 1: پیام متنی با دکمه → one-shot send_message
+        if is_text and text_content is not None and inline_markup is not None:
             try:
-                broadcast_bot.copy_message(uid, from_chat_id=from_chat_id, message_id=message_id)
-                return 'ok'
-            except:
-                return 'failed'
-        return 'failed'
-    except Exception:
-        return 'failed'
+                sent = bot.send_message(chat_id, text_content, reply_markup=final_markup)
+                return sent.message_id if sent and hasattr(sent, 'message_id') else None
+            except Exception as e:
+                logger.error(f"Preview (text one-shot) error: {e}")
+                # fallback به copy_message
+
+        # استراتژی 2: رسانه یا بدون دکمه → copy_message + editMessageReplyMarkup
+        sent = bot.copy_message(chat_id, from_chat_id=preview_msg.chat.id,
+                                message_id=preview_msg.message_id)
+        if not sent or not hasattr(sent, 'message_id'):
+            logger.error("Preview: copy_message returned no message_id")
+            return None
+        preview_msg_id = sent.message_id
+
+        # الصاق دکمه‌ها با editMessageReplyMarkup
+        try:
+            bot.edit_message_reply_markup(
+                chat_id=chat_id,
+                message_id=preview_msg_id,
+                reply_markup=final_markup,
+            )
+        except Exception as e:
+            logger.error(f"Preview: editMessageReplyMarkup failed: {e}")
+
+        return preview_msg_id
+    except Exception as e:
+        logger.error(f"send_preview_to_admin error: {e}")
+        return None
+
+def delete_preview_message(chat_id):
+    """حذف پیام پیش‌نمایش قبلی ادمین (اگه وجود داره)."""
+    msg_id = get_broadcast_preview_sent_msg_id()
+    if msg_id:
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+        set_broadcast_preview_sent_msg_id(None)
+
+# ====== پخش همگانی (نسخه بهینه‌شده — Parallel + Smart Routing) ======
+
+# Rate limiter سراسری برای جلوگیری از 429
+_broadcast_rate_lock = threading.Lock()
+_broadcast_last_send_times = deque()  # زمان‌های ارسال اخیر برای rate limiting
+
+def _rate_limit_wait(max_per_second=25):
+    """Rate limiting adaptive: اگه در آخر 1 ثانیه بیش از max_per_second ارسال شده، صبر کن."""
+    now = time.time()
+    with _broadcast_rate_lock:
+        # پاک‌سازی زمان‌های قدیمی‌تر از 1 ثانیه
+        while _broadcast_last_send_times and _broadcast_last_send_times[0] < now - 1.0:
+            _broadcast_last_send_times.popleft()
+        # اگه در آخر 1 ثانیه بیش از حد مجاز ارسال شده، صبر کن
+        if len(_broadcast_last_send_times) >= max_per_second:
+            wait_time = 1.0 - (now - _broadcast_last_send_times[0])
+            if wait_time > 0:
+                time.sleep(wait_time)
+                now = time.time()
+        _broadcast_last_send_times.append(now)
+
+# ====== پخش همگانی (نسخه بهینه‌شده — Parallel + Smart Routing) ======
+
+def _send_broadcast_single(broadcast_bot, uid, from_chat_id, message_id,
+                            reply_markup=None, is_text=False, text_content=None,
+                            parse_mode=None):
+    """ارسال یک پیام broadcast به یک کاربر.
+
+    استراتژی هوشمندانه:
+    - اگه پیام متنی است و دکمه دارد: از send_message با reply_markup استفاده می‌کند (one-shot، سریع‌تر)
+    - اگه پیام رسانه‌ای است و دکمه دارد: copy_message + editMessageReplyMarkup (دو مرحله، لازم)
+    - اگه دکمه ندارد: فقط copy_message (یک مرحله)
+
+    برمی‌گرداند: ('ok' | 'blocked' | 'failed')
+    """
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            # Rate limiting
+            _rate_limit_wait(max_per_second=25)
+
+            # استراتژی 1: پیام متنی با دکمه → one-shot send_message
+            if is_text and text_content is not None and reply_markup is not None:
+                try:
+                    broadcast_bot.send_message(
+                        uid, text_content,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode,
+                    )
+                    return 'ok'
+                except ApiTelegramException as e:
+                    if e.error_code == 403:
+                        return 'blocked'
+                    if e.error_code == 429 and attempt < max_retries:
+                        time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s
+                        continue
+                    raise
+
+            # استراتژی 2: رسانه با دکمه → copy_message + editMessageReplyMarkup
+            # استراتژی 3: بدون دکمه → فقط copy_message
+            sent = broadcast_bot.copy_message(
+                uid,
+                from_chat_id=from_chat_id,
+                message_id=message_id,
+            )
+
+            # الصاق دکمه‌ها با editMessageReplyMarkup (فقط برای رسانه با دکمه)
+            if reply_markup is not None and sent and hasattr(sent, 'message_id'):
+                try:
+                    broadcast_bot.edit_message_reply_markup(
+                        chat_id=uid,
+                        message_id=sent.message_id,
+                        reply_markup=reply_markup,
+                    )
+                except ApiTelegramException as e:
+                    # اگه edit ناموفق بود، پیام اصلی هنوز ارسال شده
+                    if e.error_code == 429:
+                        time.sleep(1)
+                        try:
+                            broadcast_bot.edit_message_reply_markup(
+                                chat_id=uid,
+                                message_id=sent.message_id,
+                                reply_markup=reply_markup,
+                            )
+                        except Exception:
+                            pass
+                    # سایر خطاها غیربحرانی هستند
+                except Exception:
+                    pass
+
+            return 'ok'
+
+        except ApiTelegramException as e:
+            if e.error_code == 403:
+                return 'blocked'
+            if e.error_code == 429 and attempt < max_retries:
+                # Rate limited — exponential backoff
+                time.sleep(2 ** attempt)
+                continue
+            return 'failed'
+        except Exception:
+            if attempt < max_retries:
+                time.sleep(0.5)
+                continue
+            return 'failed'
+    return 'failed'
 
 # ── v3.23: ادامهٔ پخش همگانی بعد از قطع/ری‌استارت (resume) ──
 BC_STATE_KEY = "broadcast_resume_state"
@@ -3781,7 +4061,8 @@ def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
             pass
 
 def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
-    """پیاده‌سازی واقعی پخش همگانی — v3.23: پشتیبانی ادامه از محل قطع."""
+    """پیاده‌سازی واقعی پخش همگانی — v3.23: پشتیبانی ادامه از محل قطع.
+    نسخه بهینه‌شده: ThreadPoolExecutor با ۸ worker موازی، smart routing برای متن/رسانه."""
     global broadcast_stop_flag
     broadcast_stop_flag.clear()
 
@@ -3805,6 +4086,11 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
             done0, from_chat_id, message_id, pre_sent, pre_blocked, pre_failed = 0, admin_chat_id, 0, 0, 0, 0
         users = db.get_broadcast_targets_offset(done0)
         is_resume = True
+        # در حالت resume، اطلاعات dکمه‌ها رو از preview_msg نمی‌گیریم (چون None است)
+        # اما برای حفظ رفتار، در resume از دکمه‌ها استفاده نمی‌کنیم (resume معمولاً برای پیام‌های بدون دکمه است)
+        current_markup = None
+        use_one_shot = False
+        text_content = None
     else:
         done0 = 0
         from_chat_id = None
@@ -3812,6 +4098,18 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
         pre_sent = pre_blocked = pre_failed = 0
         users = db.get_broadcast_targets()
         is_resume = False
+        # تشخیص نوع پیام برای smart routing
+        current_markup = get_broadcast_inline_markup()
+        is_text = hasattr(preview_msg, 'content_type') and preview_msg.content_type == 'text'
+        text_content = preview_msg.text if is_text else None
+        use_one_shot = is_text and current_markup is not None and text_content is not None
+
+    if use_one_shot:
+        logger.info("Broadcast: using ONE-SHOT send_message strategy (text + buttons)")
+    elif current_markup is not None:
+        logger.info("Broadcast: using TWO-STEP strategy (copy_message + editMessageReplyMarkup) for media with buttons")
+    else:
+        logger.info("Broadcast: using copy_message strategy (no buttons)")
 
     total = done0 + len(users)
     if len(users) == 0:
@@ -3860,66 +4158,114 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
     start_time = time.time()
     last_update = 0
     processed_this_run = 0
+    skipped_cnt = 0
+
+    # آمار شمارش thread-safe
+    stats_lock = threading.Lock()
+    counters = {'sent': sent_cnt, 'blocked': blocked_cnt, 'failed': failed_cnt, 'processed': 0}
 
     # v3.23: ثبت وضعیت اولیه برای resume
     _bc_state_write(admin_chat_id, progress_msg_id, from_chat_id, message_id, total, done0, sent_cnt, blocked_cnt, failed_cnt)
 
-    # ارسال ترتیبی
-    for i, uid in enumerate(users):
-        # چک توقف
+    def send_to_user(uid):
+        """تابع worker برای ارسال به یک کاربر."""
         if broadcast_stop_flag.is_set():
-            skipped_cnt = len(users) - i
-            break
-        else:
-            skipped_cnt = 0
+            return ('skipped', uid)
 
-        # ارسال به این کاربر
-        result = _send_broadcast_single(broadcast_bot, uid, from_chat_id, message_id)
-        if result == 'ok':
-            sent_cnt += 1
-        elif result == 'blocked':
-            blocked_cnt += 1
-            try:
-                db.mark_user_blocked_bot(uid)
-            except: pass
-        else:
-            failed_cnt += 1
-        processed_this_run += 1
-        done_now = done0 + processed_this_run
+        result = _send_broadcast_single(
+            broadcast_bot, uid, from_chat_id, message_id,
+            reply_markup=current_markup,
+            is_text=use_one_shot,
+            text_content=text_content,
+            parse_mode=None,
+        )
 
-        # به‌روزرسانی پیام پیشرفت هر ۱۰ ثانیه + ثبت وضعیت resume
-        now = time.time()
-        if progress_msg_id and (now - last_update) > 10:
-            last_update = now
-            processed = done0 + processed_this_run
-            pct = int(processed * 100 / total) if total else 100
-            elapsed = now - start_time
-            speed = processed_this_run / elapsed if elapsed > 0 else 0
-            remaining = (total - processed) / speed if speed > 0 else 0
+        with stats_lock:
+            counters['processed'] += 1
+            if result == 'ok':
+                counters['sent'] += 1
+            elif result == 'blocked':
+                counters['blocked'] += 1
+                try:
+                    db.mark_user_blocked_bot(uid)
+                except: pass
+            else:
+                counters['failed'] += 1
+
+        return (result, uid)
+
+    # ارسال موازی با ThreadPoolExecutor
+    workers = min(BROADCAST_WORKERS, 16)  # cap at 16 workers
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all tasks
+        futures = {executor.submit(send_to_user, uid): uid for uid in users}
+
+        for future in as_completed(futures):
+            if broadcast_stop_flag.is_set():
+                # لغو بقیه task ها
+                for f in futures:
+                    f.cancel()
+                skipped_cnt = sum(1 for f in futures if not f.done())
+                break
+
             try:
-                broadcast_safe_edit_text(
-                    f"📢 *پخش همگانی در حال اجرا...*\n"
-                    f"👥 کل گیرنده‌ها: {to_persian_digits(total)}\n"
-                    f"✅ ارسال موفق: {to_persian_digits(sent_cnt)}\n"
-                    f"🚫 بلاک‌شده: {to_persian_digits(blocked_cnt)}\n"
-                    f"⚠️ خطا: {to_persian_digits(failed_cnt)}\n"
-                    f"📊 پیشرفت: {to_persian_digits(pct)}٪\n"
-                    f"⚡️ سرعت: {to_persian_digits(int(speed))} پیام/ثانیه\n"
-                    f"⏱️ زمان باقی‌مانده: ~{to_persian_digits(int(remaining))} ثانیه",
-                    admin_chat_id, progress_msg_id,
-                    reply_markup=types.InlineKeyboardMarkup().add(
-                        types.InlineKeyboardButton("⏹️ توقف ارسال", callback_data="broadcast_stop")
+                result, uid = future.result()
+                if result == 'skipped':
+                    skipped_cnt += 1
+            except Exception as e:
+                logger.error(f"Broadcast worker error for uid={futures[future]}: {e}")
+                with stats_lock:
+                    counters['failed'] += 1
+                    counters['processed'] += 1
+
+            processed_this_run += 1
+            done_now = done0 + processed_this_run
+
+            # به‌روزرسانی پیام پیشرفت هر ۵ ثانیه + ثبت وضعیت resume
+            now = time.time()
+            if progress_msg_id and (now - last_update) > 5:
+                last_update = now
+                with stats_lock:
+                    sent_cnt = counters['sent']
+                    blocked_cnt = counters['blocked']
+                    failed_cnt = counters['failed']
+                    processed = done0 + counters['processed']
+                pct = int(processed * 100 / total) if total else 100
+                elapsed = now - start_time
+                speed = (processed - done0) / elapsed if elapsed > 0 else 0
+                remaining = (total - processed) / speed if speed > 0 else 0
+                try:
+                    broadcast_safe_edit_text(
+                        f"📢 *پخش همگانی در حال اجرا...*\n"
+                        f"👥 کل گیرنده‌ها: {to_persian_digits(total)}\n"
+                        f"✅ ارسال موفق: {to_persian_digits(sent_cnt)}\n"
+                        f"🚫 بلاک‌شده: {to_persian_digits(blocked_cnt)}\n"
+                        f"⚠️ خطا: {to_persian_digits(failed_cnt)}\n"
+                        f"📊 پیشرفت: {to_persian_digits(pct)}٪\n"
+                        f"⚡️ سرعت: {to_persian_digits(int(speed))} پیام/ثانیه\n"
+                        f"⏱️ زمان باقی‌مانده: ~{to_persian_digits(int(remaining))} ثانیه",
+                        admin_chat_id, progress_msg_id,
+                        reply_markup=types.InlineKeyboardMarkup().add(
+                            types.InlineKeyboardButton("⏹️ توقف ارسال", callback_data="broadcast_stop")
+                        )
                     )
-                )
-            except: pass
-            # v3.23: ثبت پیشرفت هم‌زمان با گزارش
-            _bc_state_write(admin_chat_id, progress_msg_id, from_chat_id, message_id, total, done_now, sent_cnt, blocked_cnt, failed_cnt)
-        elif (processed_this_run % 200) == 0:
-            # v3.23: ثبت پیشرفت هر ۲۰۰ پیام (اگر گزارش ۱۰ ثانیه‌ای هنوز نرسیده)
-            _bc_state_write(admin_chat_id, progress_msg_id, from_chat_id, message_id, total, done_now, sent_cnt, blocked_cnt, failed_cnt)
+                except: pass
+                # v3.23: ثبت پیشرفت هم‌زمان با گزارش
+                _bc_state_write(admin_chat_id, progress_msg_id, from_chat_id, message_id, total, done_now, sent_cnt, blocked_cnt, failed_cnt)
+            elif (processed_this_run % 200) == 0:
+                # v3.23: ثبت پیشرفت هر ۲۰۰ پیام
+                with stats_lock:
+                    sent_cnt = counters['sent']
+                    blocked_cnt = counters['blocked']
+                    failed_cnt = counters['failed']
+                _bc_state_write(admin_chat_id, progress_msg_id, from_chat_id, message_id, total, done_now, sent_cnt, blocked_cnt, failed_cnt)
 
-        # مکث کوتاه بین ارسال‌ها (۲۰ پیام در ثانیه)
-        time.sleep(0.05)
+    # اگه توقف نشده، آمار نهایی رو از counters بگیر
+    with stats_lock:
+        sent_cnt = counters['sent']
+        blocked_cnt = counters['blocked']
+        failed_cnt = counters['failed']
 
     elapsed_total = time.time() - start_time
     was_stopped = broadcast_stop_flag.is_set()
@@ -3961,6 +4307,8 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None):
         f"⏭️ رد‌شده (به‌خاطر توقف): {to_persian_digits(skipped_cnt)}\n"
         f"📊 نرخ موفقیت: {to_persian_digits(success_rate)}٪\n"
         f"⏱️ زمان کل: {to_persian_digits(int(elapsed_total))} ثانیه\n"
+        f"⚡️ سرعت میانگین: {to_persian_digits(int((total - done0) / elapsed_total if elapsed_total > 0 else 0))} پیام/ثانیه\n"
+        f"🔧 روش ارسال: {'one-shot (متن)' if use_one_shot else 'copy_message' + (' + edit' if current_markup else '')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 کاربران بلاک‌کننده به‌صورت خودکار از پخش‌های بعدی حذف می‌شوند."
     )
@@ -5606,10 +5954,27 @@ def _start_cmd_impl(message):
         except Exception:
             pass
         return
+    # در حالت تست (ADMIN_ID == 0) شناسه کاربر رو لاگ کن
+    if ADMIN_ID == 0:
+        logger.info(f"🧪 TEST MODE: /start received from chat_id={chat_id}, user_id={message.from_user.id}, username={message.from_user.username}")
     clear_user_state(chat_id)
     remove_support_session(chat_id)
     pop_support_partner(chat_id)
     pop_admin_reply(chat_id)
+
+    # در TEST MODE، اولین کاربر به‌صورت خودکار ادمین میشه
+    if ADMIN_ID == 0:
+        was_set = _set_auto_admin(chat_id)
+        if was_set:
+            try:
+                bot.reply_to(message,
+                    f"🧪 *حالت تست — ادمین خودکار*\n\n"
+                    f"شما به‌عنوان اولین کاربر، ادمین این ربات شدید!\n"
+                    f"🆔 شناسه چت شما: `{chat_id}`\n\n"
+                    f"برای دسترسی به پنل ادمین، روی /panel بزنید.",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Auto-admin notify error: {e}")
 
     if db.is_blocked(message.from_user.id):
         # رفع باگ: wrap در try/except
@@ -5878,11 +6243,24 @@ def _start_cmd_impl(message):
                 bot.reply_to(message, texts.WELCOME.format(link=user_link(user_id)), reply_markup=main_menu(user_id))
 
 # ====== پخش همگانی (با استفاده از lock + کیبورد معمولی) ======
-@bot.message_handler(func=lambda msg: broadcast_mode and msg.chat.id == broadcast_admin_chat
-                     and not (msg.text and (msg.text.startswith('✅ تأیید و ارسال') or msg.text == '❌ لغو')),
-                     content_types=['text', 'photo', 'video', 'document', 'audio', 'voice', 'animation', 'video_note'])
+# همه نوع محتوا پشتیبانی می‌شود: متن، عکس، ویدیو، صدا، ویس، گیف، استیکر، فایل، موقعیت، تماس و غیر
+# نکته: اگه در حالت انتظار دکمه‌ها (broadcast_awaiting_buttons) باشیم، این هندلر پیام‌های متنی
+# را نمی‌گیرد تا به‌جای محتوای پخش، به‌عنوان تعریف دکمه پردازش شوند.
+@bot.message_handler(
+    func=lambda msg: broadcast_mode
+                     and msg.chat.id == broadcast_admin_chat
+                     and not broadcast_awaiting_buttons
+                     and not (msg.text and (
+                         msg.text == '👁 مشاهده پیش‌نمایش'
+                         or msg.text == '❌ لغو'
+                         or msg.text == '➕ افزودن دکمه اینلاین'
+                         or msg.text == '🗑 حذف دکمه‌ها'
+                     )),
+    content_types=['text', 'photo', 'video', 'document', 'audio', 'voice',
+                   'animation', 'video_note', 'sticker', 'contact', 'location', 'venue']
+)
 def broadcast_handler(message):
-    global broadcast_preview_msg
+    global broadcast_preview_msg, broadcast_inline_markup, broadcast_preview_sent_msg_id
     with broadcast_lock:
         if not broadcast_mode:
             return
@@ -5894,21 +6272,47 @@ def broadcast_handler(message):
             except Exception as e:
                 logger.error(f"broadcast timeout notify error: {e}")
             return
+
+        # اگه پیام پیش‌نمایش قبلی وجود داره، پاکش کن
+        old_preview_id = broadcast_preview_sent_msg_id
         broadcast_preview_msg = message
+        # هر بار پیام جدید، دکمه‌های قبلی رو پاک کن
+        broadcast_inline_markup = None
+        broadcast_preview_sent_msg_id = None
         # v3.19: ددلاین ۵ دقیقه‌ای برای مرحلهٔ تأیید — اگر ادمین تأیید نکند،
         # watcher خودکار لغو می‌کند و کیبورد تأیید جمع می‌شود (جلوگیری از هنگ/کرش)
         global broadcast_confirm_deadline
         broadcast_confirm_deadline = time.time() + BROADCAST_TIMEOUT
         total_users = len(db.get_broadcast_targets())
-    # کیبورد معمولی (Reply Keyboard) به‌جای اینلاین
-    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True, one_time_keyboard=True)
-    markup.add(
-        types.KeyboardButton(f"✅ تأیید و ارسال ({total_users} کاربر)"),
-        types.KeyboardButton("❌ لغو")
-    )
+
+    # حذف پیام پیش‌نمایش قبلی (اگه بود)
+    if old_preview_id:
+        try:
+            bot.delete_message(message.chat.id, old_preview_id)
+        except Exception:
+            pass
+
+    # ارسال پیش‌نمایش به ادمین (با دکمه‌های فعلی — در اینجا هیچ‌چیز الصاق نمی‌شه چون inline_markup=None شد)
+    preview_msg_id = send_preview_to_admin(message.chat.id, message, inline_markup=None)
+
+    if preview_msg_id:
+        set_broadcast_preview_sent_msg_id(preview_msg_id)
+        preview_status_line = "👁 پیش‌نمایش بالا برای شما ارسال شد."
+    else:
+        preview_status_line = "⚠️ ارسال پیش‌نمایش ناموفق بود — ولی پیام ذخیره شد."
+
+    # کیبورد معمولی با گزینه‌های مشاهده پیش‌نمایش / افزودن دکمه / لغو
+    markup = broadcast_preview_keyboard(total_users)
     # رفع باگ: wrap در try/except
     try:
-        bot.reply_to(message, f"📢 پیش‌نمایش پیام بالا. آیا برای {total_users} کاربر ارسال شود؟\n⏳ اگر تا {BROADCAST_TIMEOUT//60} دقیقه تأیید نکنی، ارسال خودکار لغو می‌شود.", reply_markup=markup)
+        bot.reply_to(message,
+            f"📢 *پیام پخش همگانی دریافت شد*\n\n"
+            f"{preview_status_line}\n\n"
+            f"👥 این پیام برای {to_persian_digits(total_users)} کاربر ارسال خواهد شد.\n\n"
+            f"🔘 برای افزودن دکمه اینلاین به پیام، گزینه «➕ افزودن دکمه اینلاین» را بزنید.\n"
+            f"👁 برای مشاهده دوباره پیش‌نمایش، «مشاهده پیش‌نمایش» را بزنید.\n"
+            f"⏳ اگر تا {BROADCAST_TIMEOUT//60} دقیقه تأیید نکنی، ارسال خودکار لغو می‌شود.",
+            reply_markup=markup)
     except Exception as e:
         logger.error(f"broadcast preview reply error: {e}")
 
@@ -5969,24 +6373,116 @@ def _text_handler_inner(message):
                      daemon=True).start()
     text = message.text.strip()
 
-    # ====== هندلینگ کیبورد معمولی پخش همگانی (تأیید/لغو) ======
+    # ====== هندلینگ کیبورد معمولی پخش همگانی (مشاهده پیش‌نمایش / افزودن دکمه / حذف دکمه / لغو) ======
     if chat_id == ADMIN_ID and broadcast_mode and broadcast_preview_msg:
-        if text.startswith("✅ تأیید و ارسال"):
-            # شروع ارسال
-            preview_msg = broadcast_preview_msg
-            set_broadcast_mode(False, None, preview_msg, None)
-            # حذف کیبورد معمولی
-            bot.send_message(chat_id, "🚀 شروع ارسال همگانی...", reply_markup=types.ReplyKeyboardRemove())
-            # شروع ارسال در thread جداگانه با نمونه مستقل TeleBot
-            threading.Thread(
-                target=_run_broadcast_async,
-                args=(chat_id, preview_msg),
-                daemon=True
-            ).start()
+        # ----- حالت انتظار دکمه‌ها: متن دریافتی به‌عنوان تعریف دکمه‌ها پردازش می‌شود -----
+        if broadcast_awaiting_buttons:
+            # در حالت انتظار دکمه، تنها «❌ لغو» اتمام‌دهنده است
+            if text == "❌ لغو":
+                set_broadcast_awaiting_buttons(False)
+                total_users = len(db.get_broadcast_targets())
+                markup = broadcast_preview_keyboard(total_users)
+                bot.send_message(chat_id,
+                    "❌ افزودن دکمه‌ها لغو شد.\n"
+                    "می‌توانید دوباره دکمه‌ها را اضافه کنید یا پیش‌نمایش را ببینید.",
+                    reply_markup=markup)
+                return
+            # پردازش تعریف دکمه‌ها
+            success, result = parse_button_definitions(text)
+            if not success:
+                # خطا — دوباره از ادمین بخواه
+                bot.send_message(chat_id,
+                    result + "\n\nلطفاً دوباره دکمه‌ها را به‌فرمت صحیح بفرستید یا روی «❌ لغو» بزنید.",
+                    reply_markup=types.ReplyKeyboardMarkup(
+                        row_width=1, resize_keyboard=True, one_time_keyboard=True
+                    ).add(types.KeyboardButton("❌ لغو")))
+                return
+            # دکمه‌ها با موفقیت ساخته شد
+            set_broadcast_inline_markup(result)
+            set_broadcast_awaiting_buttons(False)
+            total_users = len(db.get_broadcast_targets())
+            markup = broadcast_preview_keyboard(total_users)
+
+            # حذف پیش‌نمایش قبلی
+            delete_preview_message(chat_id)
+
+            # ارسال پیش‌نمایش جدید با دکمه‌های اینلاین (با editMessageReplyMarkup)
+            preview_msg_id = send_preview_to_admin(chat_id, broadcast_preview_msg, inline_markup=result)
+            if preview_msg_id:
+                set_broadcast_preview_sent_msg_id(preview_msg_id)
+                preview_status = "👁 پیش‌نمایش بالا با دکمه‌های اینلاین الصاق‌شده ارسال شد."
+            else:
+                preview_status = "⚠️ ارسال پیش‌نمایش ناموفق بود، اما دکمه‌ها ذخیره شدند."
+
+            bot.send_message(chat_id,
+                f"✅ {to_persian_digits(len(result.keyboard))} دکمه اینلاین به پیام الصاق شد.\n\n"
+                f"{preview_status}\n\n"
+                f"اگر همه چیز درست است، روی دکمه «✅ تأیید و ارسال به همه» زیر پیام بزنید.",
+                reply_markup=markup)
+            return
+
+        # ----- دکمه‌های کنترلی کیبورد معمولی -----
+        if text == "👁 مشاهده پیش‌نمایش":
+            # حذف پیش‌نمایش قبلی
+            delete_preview_message(chat_id)
+
+            # ارسال پیش‌نمایش جدید
+            current_markup = get_broadcast_inline_markup()
+            preview_msg_id = send_preview_to_admin(chat_id, broadcast_preview_msg, inline_markup=current_markup)
+            if preview_msg_id:
+                set_broadcast_preview_sent_msg_id(preview_msg_id)
+                bot.send_message(chat_id,
+                    "👁 پیش‌نمایش بالا برای شما ارسال شد.\n"
+                    "اگر همه چیز درست است، روی دکمه «✅ تأیید و ارسال به همه» زیر پیام بزنید.",
+                    reply_markup=broadcast_preview_keyboard(len(db.get_broadcast_targets())))
+            else:
+                bot.send_message(chat_id,
+                    "⚠️ ارسال پیش‌نمایش ناموفق بود. دوباره تلاش کنید.")
             return
         elif text == "❌ لغو":
+            # حذف پیش‌نمایش قبلی
+            delete_preview_message(chat_id)
             set_broadcast_mode(False)
             bot.send_message(chat_id, "❌ ارسال همگانی لغو شد.", reply_markup=types.ReplyKeyboardRemove())
+            return
+        elif text == "➕ افزودن دکمه اینلاین":
+            # ورود به حالت انتظار تعریف دکمه‌ها
+            set_broadcast_awaiting_buttons(True)
+            instructions = (
+                "🔘 *افزودن دکمه اینلاین*\n\n"
+                "دکمه‌ها را با فرمت زیر بفرستید — هر خط یک دکمه:\n\n"
+                "`متن دکمه ۱|https://example.com`\n"
+                "`متن دکمه ۲|https://example2.com`\n\n"
+                "• جداکننده: کاراکتر `|`\n"
+                "• URL باید با `http://` یا `https://` شروع شود\n"
+                "• هر خط یک دکمه (هر کدام در یک ردیف جدا نمایش داده می‌شود)\n\n"
+                "مثال:\n"
+                "`سایت ما|https://example.com`\n"
+                "`کانال ما|https://t.me/mychannel`\n"
+                "`گروه ما|https://t.me/mygroup`"
+            )
+            bot.send_message(chat_id, instructions,
+                reply_markup=types.ReplyKeyboardMarkup(
+                    row_width=1, resize_keyboard=True, one_time_keyboard=False
+                ).add(types.KeyboardButton("❌ لغو")),
+                parse_mode="Markdown")
+            return
+        elif text == "🗑 حذف دکمه‌ها":
+            set_broadcast_inline_markup(None)
+            total_users = len(db.get_broadcast_targets())
+            markup = broadcast_preview_keyboard(total_users)
+            # حذف پیش‌نمایش قبلی
+            delete_preview_message(chat_id)
+            # ارسال پیش‌نمایش جدید بدون دکمه
+            preview_msg_id = send_preview_to_admin(chat_id, broadcast_preview_msg, inline_markup=None)
+            if preview_msg_id:
+                set_broadcast_preview_sent_msg_id(preview_msg_id)
+                preview_status = "👁 پیش‌نمایش بدون دکمه ارسال شد."
+            else:
+                preview_status = "⚠️ ارسال پیش‌نمایش ناموفق بود."
+            bot.send_message(chat_id,
+                f"🗑 دکمه‌های اینلاین حذف شدند.\n{preview_status}",
+                reply_markup=markup)
             return
 
     state = get_user_state(chat_id)
@@ -6639,6 +7135,18 @@ def photo_handler(message):
         return
     # رفع باگ: ثبت پیام برای آمار 24 ساعته
     record_message(message.from_user.id)
+
+    # اگه در حالت پخش همگانی هستیم و فرستنده ادمین است، این هندلر نباید کاری کنه
+    # (broadcast_handler باید این پیام رو بگیره — ولی اگه اینجا رسیدیم یعنی اون نگرفته)
+    with broadcast_lock:
+        if broadcast_mode and chat_id == broadcast_admin_chat and not broadcast_awaiting_buttons:
+            logger.warning("photo_handler: broadcast_mode is active but broadcast_handler didn't catch this photo — delegating manually")
+            try:
+                broadcast_handler(message)
+            except Exception as e:
+                logger.error(f"photo_handler → broadcast_handler delegation error: {e}")
+            return
+
     if db.is_blocked(chat_id):
         return
     db.sync_user_profile(chat_id, message.from_user.first_name, message.from_user.username)
@@ -6710,6 +7218,17 @@ def file_handler_support(message):
         return
     # رفع باگ: ثبت پیام برای آمار 24 ساعته
     record_message(message.from_user.id)
+
+    # اگه در حالت پخش همگانی هستیم و فرستنده ادمین است، این هندلر نباید کاری کنه
+    with broadcast_lock:
+        if broadcast_mode and chat_id == broadcast_admin_chat and not broadcast_awaiting_buttons:
+            logger.warning(f"file_handler_support: broadcast_mode is active but broadcast_handler didn't catch this {message.content_type} — delegating manually")
+            try:
+                broadcast_handler(message)
+            except Exception as e:
+                logger.error(f"file_handler_support → broadcast_handler delegation error: {e}")
+            return
+
     if db.is_blocked(chat_id):
         return
     # v3.5: آنبلاک خودکار — هر تعاملی (حتی استیکر/ویدئو) کاربر را از لیست بلاک‌ربات خارج می‌کند
@@ -9582,6 +10101,39 @@ def _callback_handler_impl(call):
                     return
                 broadcast_stop_flag.set()
                 bot.answer_callback_query(call.id, "⏹️ درخواست توقف ارسال شد. چند ثانیه طول می‌کشد...")
+                return
+
+            # ----- تأیید ارسال به همه (از روی پیام پیش‌نمایش) -----
+            if data == "broadcast_confirm_send_all":
+                if user_id != ADMIN_ID:
+                    bot.answer_callback_query(call.id, "⛔")
+                    return
+                # چک اینکه پیام پیش‌نمایش هنوز معتبره
+                with broadcast_lock:
+                    if not broadcast_mode or not broadcast_preview_msg:
+                        bot.answer_callback_query(call.id, "❌ حالت پخش همگانی فعال نیست.", show_alert=True)
+                        return
+                    preview_msg = broadcast_preview_msg
+                    current_markup = broadcast_inline_markup
+
+                # شروع ارسال
+                set_broadcast_mode(False, None, preview_msg, None)
+
+                # حذف کیبورد معمولی
+                try:
+                    bot.send_message(chat_id, "🚀 شروع ارسال همگانی...", reply_markup=types.ReplyKeyboardRemove())
+                except Exception:
+                    pass
+
+                # جلوگیری از کلیک دوبار روی دکمه (القاء loading روی callback)
+                bot.answer_callback_query(call.id, "🚀 شروع ارسال...")
+
+                # شروع ارسال در thread جداگانه با نمونه مستقل TeleBot
+                threading.Thread(
+                    target=_run_broadcast_async,
+                    args=(chat_id, preview_msg, current_markup),
+                    daemon=True
+                ).start()
                 return
 
             # ----- v3.23: ادامه/لغو پخش همگانی نیمه‌کاره (بعد از ری‌استارت) -----
