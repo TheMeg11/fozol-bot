@@ -3247,6 +3247,7 @@ CALLBACK_LABELS = {
     "settings": "تنظیمات", "mask": "نقاب", "nickname": "لقب",
     "admin_panel": "پنل ادمین", "admin_userlist": "لیست کاربران (ادمین)",
     "admin_daily": "آمار کل (ادمین)", "admin_broadcast": "پیام همگانی",
+    "admin_ad_mode": "حالت تبلیغ",
     "check_join": "بررسی عضویت", "copy_raw_link": "کپی لینک خام",
     "hide_me": "مخفیکردن نام", "lb_name": "تغییر نام نمایشی",
     "admin_price_monthly": "تغییر قیمت VIP", "admin_price_monthly_go": "تأیید قیمت‌های VIP",
@@ -3738,12 +3739,22 @@ broadcast_preview_sent_msg_id = None
 # Flag توقف پخش همگانی — ادمین می‌تواند وسط ارسال آن را متوقف کند
 broadcast_stop_flag = threading.Event()
 
+# ====== حالت تبلیغ (Ad Mode) — پیام فضول‌گیری با دکمه‌های تبلیغاتی ======
+# سوپرادمین لینک می‌دهد؛ ربات همان قالب پیام «یه فضول روی لینک شما کلیک کرد!» را
+# برای همه کاربران می‌فرستد با این تفاوت که تمام دکمه‌ها به لینک تبلیغ اشاره می‌کنند.
+broadcast_ad_awaiting_link = False   # در انتظار دریافت لینک از سوپرادمین
+broadcast_ad_link = None             # لینک تبلیغ تأییدشده (برای لاگ/نمایش)
+broadcast_ad_started_at = None       # زمان ورود به حالت — برای تایم‌اوت انتظار لینک
+# پارسر ارسال پخش؛ فقط حالت تبلیغ «Markdown» است (قالب فضول‌گیری بولد دارد)
+broadcast_parse_mode = None
+
 def set_broadcast_mode(val, chat=None, msg=None, started=None):
     """تنظیم حالت پخش همگانی.
-    هنگام خاموش کردن (val=False)، تمام متغیرهای وابسته از جمله دکمه‌ها ریست می‌شوند."""
+    هنگام خاموش کردن (val=False)، تمام متغیرهای وابسته از جمله دکمه‌ها و حالت تبلیغ ریست می‌شوند."""
     global broadcast_mode, broadcast_admin_chat, broadcast_preview_msg, broadcast_started_at
     global broadcast_confirm_deadline, broadcast_inline_markup, broadcast_awaiting_buttons
     global broadcast_preview_sent_msg_id
+    global broadcast_parse_mode, broadcast_ad_awaiting_link, broadcast_ad_link, broadcast_ad_started_at
     with broadcast_lock:
         broadcast_mode = val
         broadcast_admin_chat = chat
@@ -3754,6 +3765,10 @@ def set_broadcast_mode(val, chat=None, msg=None, started=None):
             broadcast_inline_markup = None
             broadcast_awaiting_buttons = False
             broadcast_preview_sent_msg_id = None
+            broadcast_parse_mode = None
+            broadcast_ad_awaiting_link = False
+            broadcast_ad_link = None
+            broadcast_ad_started_at = None
 
 def set_broadcast_inline_markup(markup):
     """تنظیم دکمه‌های اینلاین برای پیام پخش همگانی."""
@@ -3782,6 +3797,41 @@ def get_broadcast_preview_sent_msg_id():
     """گرفتن شناسه پیام پیش‌نمایش."""
     with broadcast_lock:
         return broadcast_preview_sent_msg_id
+
+def set_broadcast_ad_awaiting_link(val):
+    """حالت انتظار لینک تبلیغ (Ad Mode) را تنظیم می‌کند."""
+    global broadcast_ad_awaiting_link
+    with broadcast_lock:
+        broadcast_ad_awaiting_link = bool(val)
+
+def get_broadcast_ad_awaiting_link():
+    with broadcast_lock:
+        return broadcast_ad_awaiting_link
+
+def set_broadcast_ad_started_at(ts):
+    """زمان ورود به حالت تبلیغ — برای تایم‌اوت انتظار لینک."""
+    global broadcast_ad_started_at
+    with broadcast_lock:
+        broadcast_ad_started_at = ts
+
+def set_broadcast_ad_link(url):
+    global broadcast_ad_link
+    with broadcast_lock:
+        broadcast_ad_link = url
+
+def get_broadcast_ad_link():
+    with broadcast_lock:
+        return broadcast_ad_link
+
+def set_broadcast_parse_mode(pm):
+    """پارسر ارسال پخش — فقط حالت تبلیغ Markdown نیاز دارد (قالب فضول‌گیری بولد دارد)."""
+    global broadcast_parse_mode
+    with broadcast_lock:
+        broadcast_parse_mode = pm
+
+def get_broadcast_parse_mode():
+    with broadcast_lock:
+        return broadcast_parse_mode
 
 def parse_button_definitions(text):
     """تبدیل متن تعریف دکمه‌ها به InlineKeyboardMarkup.
@@ -3896,6 +3946,96 @@ def delete_preview_message(chat_id):
         except Exception:
             pass
         set_broadcast_preview_sent_msg_id(None)
+
+# ====== حالت تبلیغ (Ad Mode) — broadcast پیام فضول‌گیری با دکمه‌های تبلیغاتی ======
+
+def _build_ad_message(url):
+    """ساخت متن و دکمه‌های پیام تبلیغ — دقیقاً در قالب پیام فضول‌گیری اصلی
+    («یه فضول روی لینک شما کلیک کرد!») با این تفاوت که تمام دکمه‌ها
+    به‌جای کارهای خودشان، لینک تبلیغ را باز می‌کنند."""
+    t = datetime.datetime.now().strftime("%Y/%m/%d - %H:%M")
+    msg = (f"🔔 *یه فضول روی لینک شما کلیک کرد!*\n"
+           f"🕒 {t}\n"
+           f"👤 🕵️ فضول ناشناس\n"
+           f"🆔 مخفی 🔒\n"
+           f"📎 مخفی 🔒")
+    # همان خط کنجکاوی پیام اصلی (هویت فضول قفله!)
+    try:
+        msg += "\n\n" + texts.REVEAL_TEASE
+    except Exception:
+        pass
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("🏷️ لقب دادن", url=url),
+        types.InlineKeyboardButton("✉️ پیام ناشناس", url=url),
+        types.InlineKeyboardButton("📊 اطلاعات فضول", url=url),
+        types.InlineKeyboardButton("🎁 هدیه به فضول", url=url),
+        types.InlineKeyboardButton("📋 لیست فضول‌ها", url=url),
+        types.InlineKeyboardButton("🏠 خانه", url=url),
+    )
+    markup.add(types.InlineKeyboardButton("🔓 ببین کیه!", url=url))
+    return msg, markup
+
+def _start_ad_broadcast(chat_id, url):
+    """نمونهٔ پیام تبلیغ را برای سوپرادمین می‌فرستد و state پیش‌نمایش/تأیید را آماده می‌کند.
+    بعد از این تابع، جریان تأیید همان مسیر استاندارد پخش همگانی است
+    (دکمهٔ «✅ تأیید و ارسال به همه» روی خود پیام نمونه).
+    نکته: parse_mode=Markdown ست می‌شود چون قالب فضول‌گیری بولد دارد و
+    broadcast_bot (برخلاف bot اصلی) پارسر پیش‌فرض ندارد."""
+    try:
+        total_users = len(db.get_broadcast_targets())
+        msg_text, ad_markup = _build_ad_message(url)
+        set_broadcast_ad_link(url)
+        set_broadcast_parse_mode("Markdown")
+        # پاک‌سازی پیش‌نمایش قبلی (اگه از جلسهٔ قبل مانده)
+        delete_preview_message(chat_id)
+
+        # کیبورد نهایی = دکمه‌های تبلیغ + دکمهٔ تأیید (مثل send_preview_to_admin)
+        final_markup = types.InlineKeyboardMarkup(row_width=1)
+        for row in ad_markup.keyboard:
+            for btn in row:
+                final_markup.add(btn)
+        final_markup.add(types.InlineKeyboardButton(
+            "✅ تأیید و ارسال به همه",
+            callback_data="broadcast_confirm_send_all"
+        ))
+
+        # ارسال نمونه — خودِ پیام پیش‌نمایش، دقیقاً همان چیزی است که به کاربران می‌رسد
+        sent = bot.send_message(chat_id, msg_text, reply_markup=final_markup)
+        sent_msg_id = sent.message_id if sent and hasattr(sent, 'message_id') else None
+
+        # آماده‌سازی state استاندارد پخش همگانی (پیش‌نمایش = پیام نمونه)
+        set_broadcast_mode(True, chat_id, sent, time.time())
+        global broadcast_confirm_deadline
+        with broadcast_lock:
+            broadcast_confirm_deadline = time.time() + BROADCAST_TIMEOUT
+        set_broadcast_inline_markup(ad_markup)
+        if sent_msg_id:
+            set_broadcast_preview_sent_msg_id(sent_msg_id)
+
+        try:
+            bot.send_message(chat_id,
+                f"📣 *حالت تبلیغ فعال شد*\n\n"
+                f"👆 پیام بالا، نمونهٔ دقیق پیامی است که برای همه ارسال می‌شود.\n"
+                f"👥 گیرندگان: {to_persian_digits(total_users)} کاربر\n"
+                f"🔗 تمام دکمه‌ها به این لینک اشاره می‌کنند:\n{escape_md(url)}\n\n"
+                f"✅ اگر اوکیه، روی «تأیید و ارسال به همه» زیر همان پیام بزنید.\n"
+                f"❌ برای لغو، دکمهٔ «لغو» را بزنید.\n"
+                f"⏳ اگر تا {BROADCAST_TIMEOUT//60} دقیقه تأیید نکنید، خودکار لغو می‌شود.",
+                reply_markup=types.ReplyKeyboardMarkup(
+                    row_width=1, resize_keyboard=True, one_time_keyboard=True
+                ).add(types.KeyboardButton("❌ لغو")),
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"ad mode instructions error: {e}")
+    except Exception as e:
+        logger.error(f"ad broadcast start error: {e}")
+        set_broadcast_mode(False)
+        try:
+            bot.send_message(chat_id, "❌ خطا در ساخت پیام تبلیغ. دوباره تلاش کنید.",
+                             reply_markup=admin_panel_back_markup())
+        except Exception:
+            pass
 
 # ====== پخش همگانی (نسخه بهینه‌شده — Parallel + Smart Routing) ======
 
@@ -4056,7 +4196,7 @@ def _bc_state_read():
         pass
     return None
 
-def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
+def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None, parse_mode_arg=None):
     """اجرای پخش همگانی در thread جداگانه.
     - نمونه مستقل TeleBot (جدا از ربات اصلی)
     - ارسال موازی با ThreadPoolExecutor + rate limiter (۲۵ پیام/ثانیه)
@@ -4066,7 +4206,8 @@ def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
     - fix: در فراخوانی از callback «broadcast_confirm_send_all»، آرگومان سوم می‌تواند
       InlineKeyboardMarkup باشد (نه دیکشنری resume) — چون set_broadcast_mode(False)
       دکمه‌ها را پاک می‌کند، markup قبل از پاک‌شدن گرفته شده و باید همین‌جا منتقل شود.
-      اینجا تشخیص داده می‌شود: دیکشنری = state واقعی resume، غیردیکشنری = markup پخش تازه."""
+      اینجا تشخیص داده می‌شود: دیکشنری = state واقعی resume، غیردیکشنری = markup پخش تازه.
+    - حالت تبلیغ: parse_mode_arg («Markdown») برای رندر بولد قالب فضول‌گیری منتقل می‌شود."""
     # سازگاری فراخوانی‌ها: تفکیک markup از state واقعی resume
     markup_arg = None
     if resume_state is not None and not isinstance(resume_state, dict):
@@ -4074,7 +4215,7 @@ def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
         resume_state = None
     # رفع باگ: try/except در سطح topLevel تا thread در صورت خطا سایلنت نشود
     try:
-        _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state, markup_arg)
+        _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state, markup_arg, parse_mode_arg)
     except Exception as e:
         logger.error(f"Broadcast async fatal error: {e}")
         try:
@@ -4085,12 +4226,15 @@ def _run_broadcast_async(admin_chat_id, preview_msg, resume_state=None):
         except Exception:
             pass
 
-def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None, markup_arg=None):
+def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None, markup_arg=None, parse_mode_arg=None):
     """پیاده‌سازی واقعی پخش همگانی — v3.23: پشتیبانی ادامه از محل قطع.
     نسخه بهینه‌شده: ThreadPoolExecutor موازی، smart routing برای متن/رسانه.
     markup_arg: دکمه‌های اینلاین منتقل‌شده از callback تأیید (قبل از پاک‌شدن state)."""
     global broadcast_stop_flag
     broadcast_stop_flag.clear()
+
+    # پارسر ارسال — فقط حالت تبلیغ «Markdown» است (قالب فضول‌گیری بولد دارد)
+    bc_parse_mode = parse_mode_arg or None
 
     # ساخت نمونه مستقل TeleBot برای پخش همگانی
     try:
@@ -4206,7 +4350,7 @@ def _run_broadcast_async_impl(admin_chat_id, preview_msg, resume_state=None, mar
             reply_markup=current_markup,
             is_text=use_one_shot,
             text_content=text_content,
-            parse_mode=None,
+            parse_mode=bc_parse_mode,
         )
 
         with stats_lock:
@@ -5227,6 +5371,7 @@ def admin_cat_gift_markup():
 def admin_cat_broadcast_markup():
     m = types.InlineKeyboardMarkup(row_width=1)
     m.add(types.InlineKeyboardButton("📢 پیام همگانی", callback_data="admin_broadcast"))
+    m.add(types.InlineKeyboardButton("📣 حالت تبلیغ", callback_data="admin_ad_mode"))
     m.add(types.InlineKeyboardButton("📢 اد اجباری", callback_data="admin_forced_ads"))
     m.add(types.InlineKeyboardButton("🔙 بازگشت به پنل ادمین", callback_data="admin_panel"))
     return m
@@ -6401,6 +6546,37 @@ def _text_handler_inner(message):
                      args=(chat_id, message.from_user.first_name, message.from_user.username),
                      daemon=True).start()
     text = message.text.strip()
+
+    # ====== حالت تبلیغ: دریافت لینک تبلیغ از سوپرادمین ======
+    # (این حالت قبل از شروع broadcast_mode است — لینک باید متن خالص باشد)
+    if chat_id == ADMIN_ID and get_broadcast_ad_awaiting_link():
+        if text == "❌ لغو":
+            set_broadcast_ad_awaiting_link(False)
+            set_broadcast_ad_started_at(None)
+            set_broadcast_ad_link(None)
+            try:
+                bot.send_message(chat_id, "❌ حالت تبلیغ لغو شد.", reply_markup=types.ReplyKeyboardRemove())
+            except Exception:
+                pass
+            return
+        url = text
+        if not (url.startswith('http://') or url.startswith('https://')):
+            try:
+                bot.send_message(chat_id,
+                    "❌ لینک نامعتبر است! لینک باید با `http://` یا `https://` شروع شود.\n\n"
+                    "دوباره لینک را بفرستید یا «❌ لغو» را بزنید.",
+                    reply_markup=types.ReplyKeyboardMarkup(
+                        row_width=1, resize_keyboard=True, one_time_keyboard=False
+                    ).add(types.KeyboardButton("❌ لغو")),
+                    parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+        # لینک معتبر — بستن حالت انتظار و ساخت/ارسال نمونه
+        set_broadcast_ad_awaiting_link(False)
+        set_broadcast_ad_started_at(None)
+        _start_ad_broadcast(chat_id, url)
+        return
 
     # ====== هندلینگ کیبورد معمولی پخش همگانی (مشاهده پیش‌نمایش / افزودن دکمه / حذف دکمه / لغو) ======
     if chat_id == ADMIN_ID and broadcast_mode and broadcast_preview_msg:
@@ -10030,6 +10206,44 @@ def _callback_handler_impl(call):
                     reply_markup=markup)
                 return
 
+            # ----- حالت تبلیغ: سوپرادمین لینک می‌دهد؛ پیام فضول‌گیری با دکمه‌های تبلیغاتی برای همه می‌رود -----
+            if data == "admin_ad_mode":
+                if user_id != ADMIN_ID:
+                    try: bot.answer_callback_query(call.id, "⛔")
+                    except Exception: pass
+                    return
+                with broadcast_lock:
+                    busy = broadcast_mode
+                if busy:
+                    try: bot.answer_callback_query(call.id, "اول پخش همگانی فعلی را لغو/تأیید کنید.", show_alert=True)
+                    except Exception: pass
+                    return
+                # پاک‌سازی کامل state قبلی (شامل متغیرهای تبلیغ) و ورود به حالت دریافت لینک
+                set_broadcast_mode(False)
+                set_broadcast_ad_awaiting_link(True)
+                set_broadcast_ad_started_at(time.time())
+                try: bot.answer_callback_query(call.id)
+                except Exception: pass
+                ad_prompt = (
+                    "📣 *حالت تبلیغ*\n\n"
+                    "لینک تبلیغ خود را ارسال کنید — مثلاً:\n"
+                    "`https://github.com/TheMeg11/`\n\n"
+                    "• لینک باید با `http://` یا `https://` شروع شود\n"
+                    "• پیام فضول‌گیری («یه فضول روی لینک شما کلیک کرد!») در همان قالب اصلی برای همه ارسال می‌شود\n"
+                    "• تمام دکمه‌های پیام به لینک شما اشاره می‌کنند\n"
+                    "• اول یک نمونه برای خودتان ارسال می‌شود تا تأیید کنید\n\n"
+                    "برای لغو، «❌ لغو» را بزنید."
+                )
+                try:
+                    bot.send_message(chat_id, ad_prompt,
+                        reply_markup=types.ReplyKeyboardMarkup(
+                            row_width=1, resize_keyboard=True, one_time_keyboard=False
+                        ).add(types.KeyboardButton("❌ لغو")),
+                        parse_mode="Markdown")
+                except Exception as e:
+                    logger.error(f"ad mode prompt error: {e}")
+                return
+
             if data == "admin_support_list":
                 # حذف شد — طبق درخواست، دکمه پشتیبانی‌ها از منوی ادمین حذف شده.
                 # اما برای backward-compatibility کالبک رو نگه می‌داریم.
@@ -10142,6 +10356,9 @@ def _callback_handler_impl(call):
                     except Exception: pass
                     return
                 # چک اینکه پیام پیش‌نمایش هنوز معتبره
+                preview_msg = None
+                current_markup = None
+                bc_parse_mode = None
                 with broadcast_lock:
                     if not broadcast_mode or not broadcast_preview_msg:
                         try: bot.answer_callback_query(call.id, "❌ حالت پخش همگانی فعال نیست.", show_alert=True)
@@ -10149,6 +10366,7 @@ def _callback_handler_impl(call):
                         return
                     preview_msg = broadcast_preview_msg
                     current_markup = broadcast_inline_markup
+                    bc_parse_mode = broadcast_parse_mode
 
                 # شروع ارسال
                 set_broadcast_mode(False, None, preview_msg, None)
@@ -10168,9 +10386,10 @@ def _callback_handler_impl(call):
                     pass
 
                 # شروع ارسال در thread جداگانه با نمونه مستقل TeleBot
+                # (bc_parse_mode: فقط حالت تبلیغ Markdown است — قبل از پاک‌شدن state گرفته شد)
                 threading.Thread(
                     target=_run_broadcast_async,
-                    args=(chat_id, preview_msg, current_markup),
+                    args=(chat_id, preview_msg, current_markup, bc_parse_mode),
                     daemon=True
                 ).start()
                 return
@@ -12080,6 +12299,7 @@ def remind_inactive_users():
 def broadcast_timeout_watcher():
     global broadcast_mode, broadcast_admin_chat, broadcast_preview_msg, broadcast_started_at, broadcast_confirm_deadline
     global broadcast_inline_markup, broadcast_awaiting_buttons, broadcast_preview_sent_msg_id
+    global broadcast_parse_mode, broadcast_ad_awaiting_link, broadcast_ad_link, broadcast_ad_started_at
     while True:
         time.sleep(15)
         try:
@@ -12097,6 +12317,7 @@ def broadcast_timeout_watcher():
                     broadcast_inline_markup = None
                     broadcast_awaiting_buttons = False
                     broadcast_preview_sent_msg_id = None
+                    broadcast_parse_mode = None
             if notify_chat:
                 try:
                     # جمع‌کردن کیبورد تأیید + اطلاع‌رسانی
@@ -12114,6 +12335,21 @@ def broadcast_timeout_watcher():
                             bot.send_message(chat_to_notify, "⏱️ حالت پخش همگانی به دلیل عدم استفاده، به‌صورت خودکار لغو شد.")
                         except:
                             pass
+            # ── تایم‌اوت حالت تبلیغ (انتظار لینک از سوپرادمین) ──
+            ad_notify = None
+            with broadcast_lock:
+                if (broadcast_ad_awaiting_link and broadcast_ad_started_at
+                        and time.time() - broadcast_ad_started_at > BROADCAST_TIMEOUT):
+                    broadcast_ad_awaiting_link = False
+                    broadcast_ad_link = None
+                    broadcast_ad_started_at = None
+                    ad_notify = ADMIN_ID
+            if ad_notify:
+                try:
+                    bot.send_message(ad_notify, "⏱️ حالت تبلیغ به دلیل ارسال نکردن لینک، خودکار لغو شد.",
+                                     reply_markup=types.ReplyKeyboardRemove())
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"Broadcast watcher error: {e}")
 
